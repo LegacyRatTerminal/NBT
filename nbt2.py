@@ -1,4 +1,4 @@
-import time
+from time import time, sleep
 import numpy as np
 import talib
 from telegram.ext import Application
@@ -11,11 +11,14 @@ from tabulate import tabulate
 import os
 from dotenv import load_dotenv
 import logging
-import logging
 import sys
 import json
 from typing import Dict, List, Optional, Tuple
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
+from requests.adapters import HTTPAdapter, Retry
+from urllib3.util.retry import Retry
 
 def setup_logging():
     """Configure logging with proper encoding handling"""
@@ -46,16 +49,15 @@ def setup_logging():
 class Config:
    
     # API Credentials
-    BINANCE_API_KEY = '5UnHUp24PBWhfG43cJgMqkWUYVMUkJjJMBOWjpjCz3BLUEIzdQJnK6MaBb5X3anp'
-    BINANCE_API_SECRET = 'kLIELdxpfyG33G50lEFo8XbwGy6gaixI0BOp2R3KWPEPHen2xKdF6iuHFFWIlmPQ'
+    BINANCE_API_KEY = 'rbKr65FG6zXB7ACrhIlDmbkXHOqIKCVCMAuTPVmEOMvfxjD4i1JlpTVnEhakKK9I'
+    BINANCE_API_SECRET = 'gjIYYMJ0DB5KtNfRq2WxdUoxgi53uOdPoRuyCcSuX1vBqhA0SpMOO0L75WwfNQio'
     TELEGRAM_BOT_TOKEN = '7892769491:AAEVZuT2pQmL6034tfUt8EiV1DLDDX-XxCw'
     TELEGRAM_CHAT_ID = '7917402606'
 
     # Trading parameters
-    SYMBOLS = ['BNBUSDT', 'SOLUSDT', 'XRPUSDT', 'LINKUSDT', 'AAVEUSDT', 'ADAUSDT', 'UNIUSDT', 'TRXUSDT', 'AGLDUSDT']
-    TIMEFRAMES = {
-        '1m': '3m',
-        '3m': '5m', 
+    SYMBOLS = ['BNBUSDT', 'SOLUSDT', 'XRPUSDT', 'LINKUSDT', 'AAVEUSDT', 'ADAUSDT', 'EOSUSDT', 'ETCUSDT', 'UNIUSDT', 'ORDIUSDT', 'AGLDUSDT']
+    TIMEFRAMES = {  
+        '1m': '5m',
         '5m': '15m',
         '15m': '30m',
         '30m': '1h'
@@ -63,28 +65,28 @@ class Config:
 
     # Indicator parameters
     RSI_PERIOD = 14
-    RSI_OVERSOLD = 21  # Relaxed from 35
-    RSI_OVERBOUGHT = 79  # Relaxed from 65
+    RSI_OVERSOLD = 28  # Relaxed from 35
+    RSI_OVERBOUGHT = 72  # Relaxed from 65
     MACD_FAST = 12
     MACD_SLOW = 26
     MACD_SIGNAL = 9
     
     # Risk management
-    TRADE_AMOUNT = 0.8  # 40% of balance
-    MAX_OPEN_TRADES = 1
-    MAX_STOP_LOSS = 0.5 # 1%
-    MAX_PROFIT = .6  # 2%
+    TRADE_AMOUNT = 0.4  # 40% of balance
+    MAX_OPEN_TRADES = 2
+    MAX_STOP_LOSS = 0.8 # 1%
+    MAX_PROFIT = 0.1  # 2%
     MAX_LEVERAGE = 20
 
     # Enhanced trailing stop settings
-    INITIAL_TRAILING_STOP = 1.0  # Initial trailing stop percentage (wider)
-    MIN_TRAILING_STOP = 0.2      # Minimum trailing stop as price moves in favor
-    TRAILING_ACTIVATION = 0.4    # % profit needed before tightening trailing stop
-    TIGHTENING_STEP = 0.1       # How much to tighten trail stop as profit increases
+    INITIAL_TRAILING_STOP = 0.8  # Initial trailing stop percentage (wider)
+    MIN_TRAILING_STOP = 0.4      # Minimum trailing stop as price moves in favor
+    TRAILING_ACTIVATION = 0.8    # % profit needed before tightening trailing stop
+    TIGHTENING_STEP = 0.2       # How much to tighten trail stop as profit increases
     
     # Market conditions
     MIN_VOLUME_24H = 400000  # Minimum 24h volume in USDT
-    MAX_SPREAD_PERCENT = 0.7  # Maximum allowed spread (0.1%)
+    MAX_SPREAD_PERCENT = 0.2  # Maximum allowed spread (0.2%)
     
 class TradingStats:
     def __init__(self):
@@ -109,12 +111,39 @@ class TradingStats:
             return 0.0
         return self.winning_trades / self.total_trades
 
+
+class DataCache:
+    def __init__(self, ttl=5):  # TTL in seconds
+        self.cache = {}
+        self.ttl = ttl
+        
+    def get(self, key):
+        if key in self.cache:
+            data, timestamp = self.cache[key]
+            if time() - timestamp < self.ttl:
+                return data
+            del self.cache[key]
+        return None
+        
+    def set(self, key, value):
+        self.cache[key] = (value, time())       
+
+
 class TradingBot:
     def __init__(self):
         """Initialize the TradingBot with enhanced features"""
         try:
             self._validate_config()
             self.client = Client(Config.BINANCE_API_KEY, Config.BINANCE_API_SECRET)
+            self.client.session.mount('https://', HTTPAdapter(
+                pool_connections=25,
+                pool_maxsize=25,
+                max_retries=Retry(
+                    total=3,
+                    backoff_factor=0.1,
+                    status_forcelist=[429, 500, 502, 503, 504]
+                )
+            ))
             self._init_telegram()
             
             self.open_trades: Dict = {}
@@ -122,8 +151,15 @@ class TradingBot:
             self.stats = TradingStats()
             self.symbol_data: Dict = {}
             
+            # Add caches
+            self.indicator_cache = DataCache(ttl=5)  # Cache indicators for 1 minute
+            self.market_data_cache = DataCache(ttl=5)  # Cache market data for 5 seconds
+            
             self._setup_trading_environment()
             self._load_trading_history()
+            
+            # Initialize thread pool
+            self.thread_pool = ThreadPoolExecutor(max_workers=len(Config.SYMBOLS))
             
             logger.info("Bot initialization completed successfully")
             
@@ -277,23 +313,85 @@ class TradingBot:
                 self._failed_messages = []
             self._failed_messages.append(message)
 
-    def get_market_data(self, symbol: str) -> Optional[Dict]:
-        """Get comprehensive market data for a symbol"""
+    def get_market_data_batch(self, symbols: List[str]) -> Dict[str, Dict]:
+        """Get market data for multiple symbols in one batch"""
         try:
-            ticker = self.client.futures_ticker(symbol=symbol)
-            depth = self.client.futures_order_book(symbol=symbol)
+            # Check cache first
+            cached_data = {}
+            symbols_to_fetch = []
             
-            spread = (float(depth['asks'][0][0]) - float(depth['bids'][0][0])) / float(depth['bids'][0][0]) * 100
+            for symbol in symbols:
+                cached = self.market_data_cache.get(symbol)
+                if cached:
+                    cached_data[symbol] = cached
+                else:
+                    symbols_to_fetch.append(symbol)
+                    
+            if not symbols_to_fetch:
+                return cached_data
+                
+            # Batch ticker request
+            tickers = self.client.futures_ticker()
+            ticker_data = {t['symbol']: t for t in tickers}
             
-            return {
-                'price': float(ticker['lastPrice']),
-                'volume_24h': float(ticker['volume']),
-                'price_change_24h': float(ticker['priceChangePercent']),
-                'spread': spread
-            }
+            # Get order book data for each symbol individually
+            depth_data = {}
+            for symbol in symbols_to_fetch:
+                try:
+                    depth = self.client.futures_order_book(
+                        symbol=symbol,
+                        limit=5
+                    )
+                    depth_data[symbol] = depth
+                except Exception as e:
+                    logger.error(f"Error getting order book for {symbol}: {e}")
+                    continue
+            
+            market_data = cached_data.copy()
+            for symbol in symbols_to_fetch:
+                if symbol in ticker_data and symbol in depth_data:
+                    ticker = ticker_data[symbol]
+                    depth = depth_data[symbol]
+                    
+                    data = {
+                        'price': float(ticker['lastPrice']),
+                        'volume_24h': float(ticker['volume']),
+                        'price_change_24h': float(ticker['priceChangePercent']),
+                        'spread': (float(depth['asks'][0][0]) - float(depth['bids'][0][0])) / \
+                                 float(depth['bids'][0][0]) * 100
+                    }
+                    
+                    market_data[symbol] = data
+                    self.market_data_cache.set(symbol, data)
+                    
+            return market_data
+            
+        except Exception as e:
+            logger.error(f"Error in batch market data: {e}")
+            return {}   
+
+    def get_market_data(self, symbol: str) -> Optional[Dict]:
+        """
+        Get market data for a single symbol, with caching
+        Returns a dictionary with price, volume, and spread information
+        """
+        try:
+            # Check cache first
+            cached_data = self.market_data_cache.get(symbol)
+            if cached_data:
+                return cached_data
+                
+            # Get fresh data using batch method for efficiency
+            market_data = self.get_market_data_batch([symbol])
+            if symbol in market_data:
+                self.market_data_cache.set(symbol, market_data[symbol])
+                return market_data[symbol]
+                
+            return None
+            
         except Exception as e:
             logger.error(f"Error getting market data for {symbol}: {e}")
-            return None
+            return None                    
 
     def check_trade_conditions(self, symbol: str, side: str) -> bool:
         """Check if market conditions are suitable for trading"""
@@ -348,9 +446,31 @@ class TradingBot:
             logger.error(f"Error calculating position size for {symbol}: {e}")
             return None
 
-    def place_trade(self, symbol: str, side: str, quantity: float) -> bool:
-        """Place trade with enhanced validation and risk management"""
+    def get_current_position(self, symbol: str) -> Optional[Dict]:
+        """Get current position details for a symbol"""
         try:
+            position = self.client.futures_position_information(symbol=symbol)[0]
+            qty = float(position['positionAmt'])
+            if qty != 0:
+                return {
+                    'quantity': abs(qty),
+                    'side': 'BUY' if qty > 0 else 'SELL',
+                    'entry_price': float(position['entryPrice'])
+                }
+            return None
+        except Exception as e:
+            logger.error(f"Error getting position for {symbol}: {e}")
+            return None                
+
+    def place_trade(self, symbol: str, side: str, quantity: float) -> bool:
+        """Place trade with position checking"""
+        try:
+            # Check existing position
+            current_position = self.get_current_position(symbol)
+            if current_position:
+                logger.warning(f"Position already exists for {symbol}. Skipping trade.")
+                return False
+                
             if not self.check_trade_conditions(symbol, side):
                 return False
                 
@@ -364,7 +484,7 @@ class TradingBot:
                 quantity=quantity
             )
             
-            # Get entry price
+            # Get entry price from fills
             fills = order.get('fills', [])
             if fills:
                 entry_price = sum(float(fill['price']) * float(fill['qty']) for fill in fills) / sum(float(fill['qty']) for fill in fills)
@@ -382,7 +502,6 @@ class TradingBot:
                 'lowest_price': entry_price
             }
             
-            # Send notification
             message = (
                 f"🔔 New {side} Trade\n"
                 f"Symbol: {symbol}\n"
@@ -400,74 +519,59 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Unexpected trade error: {e}")
             return False
+        
 
     def calculate_trailing_stop(self, symbol: str, trade: dict, current_price: float) -> float:
-        """Calculate dynamic trailing stop based on price action and volatility"""
+        """
+        Calculate dynamic trailing stop with proper price tracking and risk management.
+        Returns the calculated stop price.
+        """
         try:
-            # Get ATR for volatility measurement
-            klines = self.client.futures_klines(symbol=symbol, interval='1h', limit=self.Config.ATR_PERIOD + 1)
-            highs = np.array([float(x[2]) for x in klines])
-            lows = np.array([float(x[3]) for x in klines])
-            closes = np.array([float(x[4]) for x in klines])
-            atr = talib.ATR(highs, lows, closes, timeperiod=self.Config.ATR_PERIOD)[-1]
-            
             entry_price = trade['entry_price']
+            is_long = trade['side'] == 'BUY'
             
-            if trade['side'] == 'BUY':
-                # Calculate current profit percentage
-                current_profit = ((current_price - entry_price) / entry_price) * 100
+            # Calculate current profit percentage (unified for both directions)
+            profit_multiplier = 1 if is_long else -1
+            current_profit = ((current_price - entry_price) / entry_price) * 100 * profit_multiplier
+            
+            # Update high/low water marks
+            if is_long:
+                trade['highest_price'] = max(trade['highest_price'], current_price)
+                reference_price = trade['highest_price']
+            else:
+                trade['lowest_price'] = min(trade['lowest_price'], current_price)
+                reference_price = trade['lowest_price']
                 
-                # Start with initial wide trailing stop
-                if current_profit < self.Config.TRAILING_ACTIVATION:
-                    trailing_percentage = self.Config.INITIAL_TRAILING_STOP
-                else:
-                    # Tighten stop as profit increases
-                    profit_steps = (current_profit - self.Config.TRAILING_ACTIVATION) // self.Config.TIGHTENING_STEP
-                    trailing_percentage = max(
-                        self.Config.INITIAL_TRAILING_STOP - (profit_steps * 0.1),
-                        self.Config.MIN_TRAILING_STOP
-                    )
-                
-                # Adjust based on volatility (ATR)
-                atr_percentage = (atr / current_price) * 100
-                trailing_percentage = max(trailing_percentage, atr_percentage * 0.5)
-                
-                # Calculate stop price
-                trailing_stop_price = max(
-                    trade['highest_price'] * (1 - trailing_percentage/100),
-                    entry_price * (1 + self.Config.MIN_TRAILING_STOP/100)  # Never go below small profit
+            # Determine trailing stop percentage based on profit level
+            if current_profit < Config.TRAILING_ACTIVATION:
+                trailing_percentage = Config.INITIAL_TRAILING_STOP
+            else:
+                # Progressive tightening as profit increases
+                profit_steps = (current_profit - Config.TRAILING_ACTIVATION) // Config.TIGHTENING_STEP
+                trailing_percentage = max(
+                    Config.INITIAL_TRAILING_STOP - (profit_steps * Config.TIGHTENING_STEP),
+                    Config.MIN_TRAILING_STOP
                 )
                 
-            else:  # SELL/SHORT position
-                current_profit = ((entry_price - current_price) / entry_price) * 100
+            # Calculate stop price based on position direction
+            if is_long:
+                stop_price = reference_price * (1 - trailing_percentage/100)
+            else:
+                stop_price = reference_price * (1 + trailing_percentage/100)
                 
-                if current_profit < self.Config.TRAILING_ACTIVATION:
-                    trailing_percentage = self.Config.INITIAL_TRAILING_STOP
-                else:
-                    profit_steps = (current_profit - self.Config.TRAILING_ACTIVATION) // self.Config.TIGHTENING_STEP
-                    trailing_percentage = max(
-                        self.Config.INITIAL_TRAILING_STOP - (profit_steps * 0.1),
-                        self.Config.MIN_TRAILING_STOP
-                    )
-                
-                atr_percentage = (atr / current_price) * 100
-                trailing_percentage = max(trailing_percentage, atr_percentage * 0.5)
-                
-                trailing_stop_price = min(
-                    trade['lowest_price'] * (1 + trailing_percentage/100),
-                    entry_price * (1 - self.Config.MIN_TRAILING_STOP/100)
-                )
-                
-            return trailing_stop_price
+            return stop_price
             
         except Exception as e:
-            logger.error(f"Error calculating dynamic trailing stop: {e}")
-            # Fallback to basic trailing stop
-            if trade['side'] == 'BUY':
-                return trade['highest_price'] * (1 - self.Config.INITIAL_TRAILING_STOP/100)
+            logger.error(f"Error in calculate_trailing_stop for {symbol}: {e}")
+            # Return a conservative fallback based on the last known reference price
+            if 'highest_price' in trade and is_long:
+                return trade['highest_price'] * (1 - Config.INITIAL_TRAILING_STOP/100)
+            elif 'lowest_price' in trade and not is_long:
+                return trade['lowest_price'] * (1 + Config.INITIAL_TRAILING_STOP/100)
             else:
-                return trade['lowest_price'] * (1 + self.Config.INITIAL_TRAILING_STOP/100)            
-                
+                # Ultimate fallback using entry price if no reference price available
+                return entry_price * (1 + (Config.INITIAL_TRAILING_STOP/100 * (-1 if is_long else 1)))             
+
 
     def get_indicators(self, symbol: str) -> Dict[str, Dict]:
         """Calculate RSI Divergence, MACD, and EMAs"""
@@ -577,80 +681,68 @@ class TradingBot:
                     logger.error(f"Invalid price for {symbol}: {current_price}")
                     continue
                 
-                # Update trade metrics
-                if trade['side'] == 'BUY':
-                    trade['highest_price'] = max(trade['highest_price'], current_price)
-                    trailing_stop_price = trade['highest_price'] * (1 - Config.INITIAL_TRAILING_STOP/100)
-                    
-                    # Check exit conditions
-                    should_exit = (
-                        current_price <= trailing_stop_price or
-                        current_price <= trade['entry_price'] * (1 - Config.MAX_STOP_LOSS/100) or
-                        current_price >= trade['entry_price'] * (1 + Config.MAX_PROFIT/100)
-                    )
-                    
-                    if should_exit:
-                        self.close_trade(symbol, 'SELL')
+                # Calculate trailing stop using the improved function
+                trailing_stop_price = self.calculate_trailing_stop(symbol, trade, current_price)
+                is_long = trade['side'] == 'BUY'
                 
-                else:  # SHORT trade
-                    trade['lowest_price'] = min(trade['lowest_price'], current_price)
-                    trailing_stop_price = trade['lowest_price'] * (1 + Config.INITIAL_TRAILING_STOP/100)
+                # Determine exit conditions based on position direction
+                should_exit = False
+                
+                if is_long:
+                    # Long position exit conditions
+                    stop_hit = current_price <= trailing_stop_price
+                    max_loss_hit = current_price <= trade['entry_price'] * (1 - Config.MAX_STOP_LOSS/100)
+                    take_profit_hit = current_price >= trade['entry_price'] * (1 + Config.MAX_PROFIT/100)
                     
-                    # Check exit conditions
-                    should_exit = (
-                        current_price >= trailing_stop_price or
-                        current_price >= trade['entry_price'] * (1 + Config.MAX_STOP_LOSS/100) or
-                        current_price <= trade['entry_price'] * (1 - Config.MAX_PROFIT/100)
+                    should_exit = stop_hit or max_loss_hit or take_profit_hit
+                    exit_reason = (
+                        "Trailing Stop" if stop_hit else
+                        "Stop Loss" if max_loss_hit else
+                        "Take Profit" if take_profit_hit else
+                        "Unknown"
                     )
                     
-                    if should_exit:
-                        self.close_trade(symbol, 'BUY')
-                        
+                else:
+                    # Short position exit conditions
+                    stop_hit = current_price >= trailing_stop_price
+                    max_loss_hit = current_price >= trade['entry_price'] * (1 + Config.MAX_STOP_LOSS/100)
+                    take_profit_hit = current_price <= trade['entry_price'] * (1 - Config.MAX_PROFIT/100)
+                    
+                    should_exit = stop_hit or max_loss_hit or take_profit_hit
+                    exit_reason = (
+                        "Trailing Stop" if stop_hit else
+                        "Stop Loss" if max_loss_hit else
+                        "Take Profit" if take_profit_hit else
+                        "Unknown"
+                    )
+                
+                if should_exit:
+                    logger.info(f"Exiting {symbol} trade due to {exit_reason}")
+                    self.close_trade(symbol, 'SELL' if is_long else 'BUY')
+                    
             except Exception as e:
                 logger.error(f"Error managing trade for {symbol}: {e}")
 
-    def check_signal(self, timeframe_data: Dict) -> Optional[str]:
-        """Check for valid trading signals using RSI Divergence, MACD, and EMAs"""
-        rsi = timeframe_data['rsi']
-        macd = timeframe_data['macd']
-        trend = timeframe_data['trend']
-        
-        # Check for long signal
-        long_signal = (
-            rsi['divergence'] == "bullish" and  # RSI shows bullish divergence
-            macd['macd'] > macd['signal'] and  # MACD above signal line
-            macd['hist'] > macd['hist_prev'] and  # MACD histogram increasing
-            trend['ema20'] > trend['ema50']  # Uptrend confirmation
-        )
-        
-        # Check for short signal
-        short_signal = (
-            rsi['divergence'] == "bearish" and  # RSI shows bearish divergence
-            macd['macd'] < macd['signal'] and  # MACD below signal line
-            macd['hist'] < macd['hist_prev'] and  # MACD histogram decreasing
-            trend['ema20'] < trend['ema50']  # Downtrend confirmation
-        )
-        
-        if long_signal:
-            return "LONG"
-        elif short_signal:
-            return "SHORT"
-        
-        return None
-    
 
 
     def close_trade(self, symbol: str, side: str):
-        """Close trade with comprehensive reporting"""
+        """Close entire position for a symbol"""
         try:
-            trade = self.open_trades[symbol]
+            # Get current position
+            current_position = self.get_current_position(symbol)
+            if not current_position:
+                logger.warning(f"No position found for {symbol}")
+                if symbol in self.open_trades:
+                    del self.open_trades[symbol]
+                return
             
-            # Close position
+            # Close entire position
             order = self.client.futures_create_order(
                 symbol=symbol,
                 side=side,
                 type='MARKET',
-                quantity=trade['quantity']
+                quantity=current_position['quantity'],
+                reduceOnly=True  # Ensure we only close existing position
             )
             
             # Calculate exit price and PnL
@@ -660,30 +752,30 @@ class TradingBot:
             else:
                 exit_price = float(self.client.futures_symbol_ticker(symbol=symbol)['price'])
             
-            entry_price = trade['entry_price']
+            trade = self.open_trades.get(symbol, {})
+            entry_price = trade.get('entry_price', current_position['entry_price'])
             pnl = ((exit_price - entry_price) / entry_price * 100) * (-1 if side == 'BUY' else 1)
             
             # Record trade data
             trade_data = {
                 'symbol': symbol,
-                'side': trade['side'],
+                'side': current_position['side'],
                 'entry_price': entry_price,
                 'exit_price': exit_price,
-                'quantity': trade['quantity'],
+                'quantity': current_position['quantity'],
                 'pnl': pnl,
-                'entry_time': trade['entry_time'].isoformat(),
+                'entry_time': trade.get('entry_time', datetime.now() - timedelta(minutes=1)).isoformat(),
                 'exit_time': datetime.now().isoformat(),
-                'duration': str(datetime.now() - trade['entry_time'])
+                'duration': str(datetime.now() - trade.get('entry_time', datetime.now() - timedelta(minutes=1)))
             }
             
             self.stats.add_trade(trade_data)
             self._save_trading_history()
             
-            # Send notification
             message = (
                 f"🔔 Trade Closed\n"
                 f"Symbol: {symbol}\n"
-                f"Side: {trade['side']}\n"
+                f"Side: {current_position['side']}\n"
                 f"P/L: {pnl:.2f}%\n"
                 f"Entry: {entry_price:.4f}\n"
                 f"Exit: {exit_price:.4f}\n"
@@ -691,84 +783,16 @@ class TradingBot:
             )
             self.loop.run_until_complete(self.send_telegram(message))
             
-            del self.open_trades[symbol]
-            
+            if symbol in self.open_trades:
+                del self.open_trades[symbol]
+                
         except Exception as e:
             logger.error(f"Error closing trade for {symbol}: {e}")
 
 
-    def format_market_analysis(self, status_data: List[List]) -> str:
-        """Format market analysis data for Telegram message"""
-        if not status_data:
-            return "No significant signals detected"
-            
-        # Create header for Telegram message
-        message = "📊 Market Analysis\n\n"
-        
-        # Format each signal entry
-        for data in status_data:
-            symbol, timeframe, rsi, rsi_div, macd_hist, macd_cross, signal, price = data
-            
-            # Add emoji indicators
-            signal_emoji = "🟢" if signal == "LONG" else "🔴" if signal == "SHORT" else "⚪"
-            trend_emoji = "📈" if macd_cross == "Yes" else "📉"
-            
-            entry = (
-                f"{signal_emoji} {symbol} ({timeframe})\n"
-                f"Signal: {signal} {trend_emoji}\n"
-                f"RSI: {rsi} ({rsi_div})\n"
-                f"MACD Hist: {macd_hist}\n"
-                f"Price: {price}\n"
-                f"-------------------\n"
-            )
-            message += entry
-        
-        return message
-
-    def send_status_update(self):
-        """Send comprehensive status update via Telegram"""
-        try:
-            # Get account information
-            account = self.client.futures_account()
-            balance = float(account['totalWalletBalance'])
-            total_upnl = float(account['totalUnrealizedProfit'])
-            
-            # Create status message
-            status = (
-                f"🤖 Bot Status Update\n\n"
-                f"💰 Account Summary:\n"
-                f"Balance: {balance:.2f} USDT\n"
-                f"Unrealized P/L: {total_upnl:.2f} USDT\n"
-                f"Open Trades: {len(self.open_trades)}\n"
-                f"Win Rate: {self.stats.get_win_rate():.1%}\n\n"
-            )
-            
-            # Add open positions if any
-            if self.open_trades:
-                status += "📍 Open Positions:\n"
-                for symbol, trade in self.open_trades.items():
-                    current_price = float(self.client.futures_symbol_ticker(symbol=symbol)['price'])
-                    pnl = ((current_price - trade['entry_price']) / trade['entry_price'] * 100) * \
-                          (1 if trade['side'] == 'BUY' else -1)
-                          
-                    status += (
-                        f"{symbol}: {trade['side']}\n"
-                        f"Entry: {trade['entry_price']:.4f}\n"
-                        f"Current: {current_price:.4f}\n"
-                        f"P/L: {pnl:.2f}%\n"
-                        f"-------------------\n"
-                    )
-            
-            self.loop.run_until_complete(self.send_telegram(status))
-            
-        except Exception as e:
-            logger.error(f"Error sending status update: {e}")    
-        
-            
-
     def get_multi_timeframe_signals(self, symbol: str) -> Dict[str, Dict]:
         """
-        Analyze trading signals across multiple timeframes with confirmation
+        Analyze trading signals across multiple timeframes with relaxed confirmation
         Returns a dictionary of valid signals with their strength and timeframe info
         """
         try:
@@ -788,153 +812,228 @@ class TradingBot:
                 primary_data = timeframe_indicators[primary_tf]
                 confirm_data = timeframe_indicators[confirm_tf]
                 
-                # Check for long signal
+                # For long signals - Relaxed conditions
                 long_conditions = {
                     'primary': (
                         primary_data['rsi']['current'] < Config.RSI_OVERSOLD and
                         primary_data['macd']['hist'] > primary_data['macd']['hist_prev'] and
-                        primary_data['trend']['ema20'] > primary_data['trend']['ema50']
+                        # Removed positive MACD histogram requirement
+                        abs(primary_data['macd']['hist'] - primary_data['macd']['hist_prev']) > 0.0006  # Reduced momentum threshold
                     ),
                     'confirm': (
-                        confirm_data['rsi']['current'] < 45 and
-                        confirm_data['macd']['hist'] > confirm_data['macd']['hist_prev']
+                        confirm_data['rsi']['current'] < 50 and  # Relaxed RSI requirement
+                        (confirm_data['trend']['ema20'] > confirm_data['trend']['ema50'] or  # Either EMA trend
+                         confirm_data['macd']['hist'] > confirm_data['macd']['hist_prev'])   # or MACD trend is positive
                     )
                 }
-                
-                # Check for short signal
+
+                # For short signals - Relaxed conditions
                 short_conditions = {
                     'primary': (
                         primary_data['rsi']['current'] > Config.RSI_OVERBOUGHT and
                         primary_data['macd']['hist'] < primary_data['macd']['hist_prev'] and
-                        primary_data['trend']['ema20'] < primary_data['trend']['ema50']
+                        # Removed negative MACD histogram requirement
+                        abs(primary_data['macd']['hist'] - primary_data['macd']['hist_prev']) > 0.0006  # Reduced momentum threshold
                     ),
                     'confirm': (
-                        confirm_data['rsi']['current'] > 55 and
-                        confirm_data['macd']['hist'] < confirm_data['macd']['hist_prev']
+                        confirm_data['rsi']['current'] > 50 and  # Relaxed RSI requirement
+                        (confirm_data['trend']['ema20'] < confirm_data['trend']['ema50'] or  # Either EMA trend
+                         confirm_data['macd']['hist'] < confirm_data['macd']['hist_prev'])   # or MACD trend is negative
                     )
                 }
                 
-                # Calculate signal strength (0-1)
+                # Calculate signal strength (0-1) with modified weights
                 if long_conditions['primary'] and long_conditions['confirm']:
                     rsi_strength = (Config.RSI_OVERSOLD - primary_data['rsi']['current']) / Config.RSI_OVERSOLD
-                    macd_strength = abs(primary_data['macd']['hist']) / abs(primary_data['macd']['hist_prev'])
-                    trend_strength = (primary_data['trend']['ema20'] / primary_data['trend']['ema50'] - 1)
+                    macd_strength = abs(primary_data['macd']['hist']) / (abs(primary_data['macd']['hist_prev']) + 0.00001)
+                    trend_strength = 1 if primary_data['trend']['ema20'] > primary_data['trend']['ema50'] else 0.5
                     
-                    strength = (rsi_strength + macd_strength + trend_strength) / 3
+                    strength = (rsi_strength * 0.4 + macd_strength * 0.4 + trend_strength * 0.2)
                     
                     valid_signals[f"{primary_tf}_LONG"] = {
                         'signal': 'LONG',
                         'strength': strength,
                         'primary_tf': primary_tf,
-                        'confirm_tf': confirm_tf
+                        'confirm_tf': confirm_tf,
+                        'rsi': primary_data['rsi']['current'],
+                        'macd_hist': primary_data['macd']['hist']
                     }
                     
                 elif short_conditions['primary'] and short_conditions['confirm']:
                     rsi_strength = (primary_data['rsi']['current'] - Config.RSI_OVERBOUGHT) / (100 - Config.RSI_OVERBOUGHT)
-                    macd_strength = abs(primary_data['macd']['hist']) / abs(primary_data['macd']['hist_prev'])
-                    trend_strength = (1 - primary_data['trend']['ema20'] / primary_data['trend']['ema50'])
+                    macd_strength = abs(primary_data['macd']['hist']) / (abs(primary_data['macd']['hist_prev']) + 0.00001)
+                    trend_strength = 1 if primary_data['trend']['ema20'] < primary_data['trend']['ema50'] else 0.5
                     
-                    strength = (rsi_strength + macd_strength + trend_strength) / 3
+                    strength = (rsi_strength * 0.4 + macd_strength * 0.4 + trend_strength * 0.2)
                     
                     valid_signals[f"{primary_tf}_SHORT"] = {
                         'signal': 'SHORT',
                         'strength': strength,
                         'primary_tf': primary_tf,
-                        'confirm_tf': confirm_tf
+                        'confirm_tf': confirm_tf,
+                        'rsi': primary_data['rsi']['current'],
+                        'macd_hist': primary_data['macd']['hist']
                     }
             
             return valid_signals
             
         except Exception as e:
             logger.error(f"Error analyzing multi-timeframe signals for {symbol}: {e}")
-            return {}
-
-                  
+            return {}        
+                
+                            
     def check_signals(self):
-        """Check for trading signals across all timeframes with enhanced reporting"""
-        if len(self.open_trades) >= Config.MAX_OPEN_TRADES:
-            logger.info("Maximum open trades reached, skipping signal check")
-            return
-            
+        """Check for trading signals across all timeframes with parallel processing"""
         status_data = []
-        logger.info("Starting signal check for all symbols...")
         
-        for symbol in Config.SYMBOLS:
+        def process_symbol(symbol: str) -> Optional[Dict]:
             try:
-                if symbol in self.open_trades:
-                    continue
-                    
-                logger.info(f"Checking signals for {symbol}")
-                
-                market_data = self.get_market_data(symbol)
+                # Get cached market data
+                market_data = self.market_data_cache.get(symbol)
                 if not market_data:
-                    logger.warning(f"No market data available for {symbol}")
-                    continue
+                    return None
                     
-                timeframe_indicators = self.get_indicators(symbol)
-                if not timeframe_indicators:
-                    logger.warning(f"No indicator data available for {symbol}")
-                    continue
-                
                 current_price = market_data['price']
                 
-                # Get signals from multi-timeframe analysis
-                timeframe_signals = self.get_multi_timeframe_signals(symbol)
-                logger.info(f"Signals detected for {symbol}: {timeframe_signals}")
+                # Get indicators with caching
+                cached_indicators = self.indicator_cache.get(f"{symbol}_indicators")
+                if cached_indicators:
+                    timeframe_indicators = cached_indicators
+                else:
+                    timeframe_indicators = self.get_indicators(symbol)
+                    if timeframe_indicators:
+                        self.indicator_cache.set(f"{symbol}_indicators", timeframe_indicators)
                 
-                if timeframe_signals:
-                    # Sort signals by strength and get the strongest one
-                    best_signal = max(timeframe_signals.values(), key=lambda x: x['strength'])
-                    logger.info(f"Best signal for {symbol}: {best_signal}")
-                    
-                    if best_signal['strength'] > 0.7:  # Minimum strength threshold
-                        signal = best_signal['signal']
-                        quantity = self.get_position_size(symbol)
+                if not timeframe_indicators:
+                    return None
+                
+                # Process signals
+                try:
+                    timeframe_signals = self.get_multi_timeframe_signals(symbol)
+                except Exception as e:
+                    logger.error(f"Error getting signals for {symbol}: {e}")
+                    timeframe_signals = {}
+                
+                symbol_data = []
+                
+                # Process each timeframe
+                for tf in Config.TIMEFRAMES:
+                    if tf in timeframe_indicators:
+                        tf_data = timeframe_indicators[tf]
                         
-                        if quantity and self.check_trade_conditions(symbol, signal):
-                            logger.info(f"Strong {signal} signal detected for {symbol} on {best_signal['primary_tf']}/{best_signal['confirm_tf']}")
-                            
-                            # Place the trade
-                            side = 'BUY' if signal == 'LONG' else 'SELL'
-                            self.place_trade(symbol, side, quantity)
+                        rsi_current = tf_data.get('rsi', {}).get('current', 0)
+                        rsi_div = tf_data.get('rsi', {}).get('divergence', 'none')
                         
-                        # Add to status data regardless of trade placement
-                        status_data.append([
+                        macd_data = tf_data.get('macd', {})
+                        macd_hist = macd_data.get('hist', 0)
+                        macd_cross = "Yes" if macd_data.get('macd', 0) > macd_data.get('signal', 0) else "No"
+                        
+                        signal = (timeframe_signals.get(f"{tf}_LONG", {}).get('signal', 'None') or 
+                                 timeframe_signals.get(f"{tf}_SHORT", {}).get('signal', 'None'))
+                        
+                        symbol_data.append([
                             symbol,
-                            f"{best_signal['primary_tf']}/{best_signal['confirm_tf']}",
-                            f"{timeframe_indicators[best_signal['primary_tf']]['rsi']['current']:.2f}",
-                            f"{timeframe_indicators[best_signal['primary_tf']]['rsi']['divergence']}",
-                            f"{timeframe_indicators[best_signal['primary_tf']]['macd']['hist']:.4f}",
-                            "Yes" if timeframe_indicators[best_signal['primary_tf']]['macd']['macd'] > 
-                                    timeframe_indicators[best_signal['primary_tf']]['macd']['signal'] else "No",
+                            tf,
+                            f"{rsi_current:.2f}",
+                            f"{rsi_div}",
+                            f"{macd_hist:.4f}",
+                            macd_cross,
                             signal,
                             f"{current_price:.4f}"
                         ])
-                        logger.info(f"Added status data for {symbol}")
-                    
-            except Exception as e:
-                logger.error(f"Error checking signals for {symbol}: {e}", exc_info=True)
                 
-        # Display status table in console with debug info
-        logger.info(f"Total signals detected: {len(status_data)}")
-        if status_data:
-            table = tabulate(
-                status_data,
-                headers=['Symbol', 'TF', 'RSI', 'RSI Div', 'MACD Hist', 'MACD Cross', 'Signal', 'Price'],
-                tablefmt='grid'
-            )
-            print("\nMarket Analysis:")
-            print(table)
+                return {
+                    'symbol_data': symbol_data,
+                    'signals': timeframe_signals
+                }
+                
+            except Exception as e:
+                logger.error(f"Error processing {symbol}: {e}")
+                return None
+        
+        try:
+            # Get batch market data first
+            market_data = self.get_market_data_batch(Config.SYMBOLS)
+            for symbol, data in market_data.items():
+                self.market_data_cache.set(symbol, data)
             
-            # Send formatted analysis to Telegram
-            analysis_message = self.format_market_analysis(status_data)
-            logger.info("Sending analysis to Telegram")
-            self.loop.run_until_complete(self.send_telegram(analysis_message))
-        else:
-            logger.info("No signals detected in this iteration")
-            print("\nNo significant signals detected at this time")
+            # Process symbols in parallel
+            futures = [
+                self.thread_pool.submit(process_symbol, symbol)
+                for symbol in Config.SYMBOLS
+            ]
+            
+            for future in as_completed(futures):
+                try:
+                    result = future.result()
+                    if result:
+                        status_data.extend(result['symbol_data'])
+                        
+                        # Process trading signals if conditions are met
+                        signals = result['signals']
+                        if signals and len(self.open_trades) < Config.MAX_OPEN_TRADES:
+                            best_signal = max(signals.values(), key=lambda x: x['strength'])
+                            if best_signal['strength'] > 0.7:
+                                symbol = result['symbol_data'][0][0]  # Get symbol from data
+                                signal = best_signal['signal']
+                                quantity = self.get_position_size(symbol)
+                                if quantity and self.check_trade_conditions(symbol, signal):
+                                    side = 'BUY' if signal == 'LONG' else 'SELL'
+                                    self.place_trade(symbol, side, quantity)
+                        
+                except Exception as e:
+                    logger.error(f"Error completing future: {e}")
+            
+            # Display results
+            if status_data:
+                table = tabulate(
+                    status_data,
+                    headers=['Symbol', 'TF', 'RSI', 'RSI Div', 'MACD Hist', 'MACD Cross', 'Signal', 'Price'],
+                    tablefmt='grid'
+                )
+                print("\nMarket Analysis:")
+                print(table)
+                
+        except Exception as e:
+            logger.error(f"Error in check_signals: {e}")
+
         
 
+    def synchronize_trades(self):
+        """Synchronize internal trade tracking with actual positions"""
+        try:
+            # Get all current positions
+            positions = {
+                pos['symbol']: self.get_current_position(pos['symbol'])
+                for pos in self.client.futures_position_information()
+                if float(pos['positionAmt']) != 0
+            }
+            
+            # Remove tracked trades that no longer exist
+            for symbol in list(self.open_trades.keys()):
+                if symbol not in positions:
+                    logger.warning(f"Removing phantom trade for {symbol}")
+                    del self.open_trades[symbol]
+            
+            # Add missing trades to tracking
+            for symbol, position in positions.items():
+                if symbol not in self.open_trades:
+                    logger.warning(f"Adding missing trade for {symbol}")
+                    self.open_trades[symbol] = {
+                        'side': position['side'],
+                        'entry_price': position['entry_price'],
+                        'quantity': position['quantity'],
+                        'entry_time': datetime.now() - timedelta(minutes=1),  # Approximate
+                        'order_id': None,
+                        'highest_price': position['entry_price'],
+                        'lowest_price': position['entry_price']
+                    }
+                    
+        except Exception as e:
+            logger.error(f"Error synchronizing trades: {e}")
+                
+
+            
     def display_open_trades(self):
         """Display current open trades with enhanced metrics"""
         if not self.open_trades:
@@ -974,14 +1073,47 @@ class TradingBot:
             ))
             print(f"Total P/L: {total_pnl:.2f}%")
 
+    def send_status_update(self):
+        """Send periodic status update with trading statistics"""
+        try:
+            # Get account information
+            account = self.client.futures_account()
+            balance = float(account['totalWalletBalance'])
+            
+            # Calculate trading statistics
+            win_rate = self.stats.get_win_rate() * 100
+            total_trades = self.stats.total_trades
+            
+            # Format status message
+            status_message = (
+                "📊 Trading Bot Status Update\n"
+                f"Balance: {balance:.2f} USDT\n"
+                f"Total Trades: {total_trades}\n"
+                f"Win Rate: {win_rate:.1f}%\n"
+                f"Open Positions: {len(self.open_trades)}\n"
+                f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+            
+            # Send status via Telegram
+            self.send_telegram_message(status_message)
+            logger.info("Status update sent successfully")
+            
+        except Exception as e:
+            logger.error(f"Error sending status update: {e}")                
+
 
     def run(self):
-        """Main bot loop with enhanced error handling and status reporting"""
+        """Main bot loop with improved performance"""
         self.running = True
         error_count = 0
         max_consecutive_errors = 5
-        last_status_update = datetime.now()
-        status_update_interval = timedelta(minutes=30)  # Status update every 30 minutes
+        last_status_update = time()
+        last_sync = time()
+        last_market_update = time()
+        
+        status_update_interval = 1800  # 30 minutes in seconds
+        sync_interval = 300  # 5 minutes in seconds
+        market_update_interval = 5  # 5 seconds
         
         logger.info("Bot starting...")
         self.loop.run_until_complete(self.send_telegram("🟢 Trading Bot Started"))
@@ -989,18 +1121,30 @@ class TradingBot:
         try:
             while self.running:
                 try:
-                    # Main trading operations
-                    self.check_signals()
-                    self.manage_trades()
-                    self.display_open_trades()
+                    current_time = time()
                     
-                    # Periodic status update
-                    if datetime.now() - last_status_update > status_update_interval:
+                    # Fast updates (every iteration)
+                    self.manage_trades()
+                    
+                    # Market data updates (every 5 seconds)
+                    if current_time - last_market_update >= market_update_interval:
+                        self.get_market_data_batch(Config.SYMBOLS)
+                        self.check_signals()
+                        self.display_open_trades()
+                        last_market_update = current_time
+                    
+                    # Position sync (every 5 minutes)
+                    if current_time - last_sync >= sync_interval:
+                        self.synchronize_trades()
+                        last_sync = current_time
+                    
+                    # Status updates (every 30 minutes)
+                    if current_time - last_status_update >= status_update_interval:
                         self.send_status_update()
-                        last_status_update = datetime.now()
+                        last_status_update = current_time
                     
                     error_count = 0
-                    time.sleep(1)
+                    sleep(0.1)  # Reduced sleep time for more responsiveness
                     
                 except Exception as e:
                     error_count += 1
@@ -1012,8 +1156,8 @@ class TradingBot:
                             f"🛑 Bot stopped after {error_count} consecutive errors"
                         ))
                         break
-                        
-                    time.sleep(10)
+                    
+                    time.sleep(5)
                     
         except KeyboardInterrupt:
             logger.info("Bot manually stopped")
@@ -1021,6 +1165,8 @@ class TradingBot:
             
         finally:
             self._save_trading_history()
+            self.thread_pool.shutdown()  # Clean up thread pool
+
 if __name__ == "__main__":
     try:
         logger = setup_logging()
